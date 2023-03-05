@@ -7,13 +7,14 @@ interface ILendingPool {
     function mint(address to, uint256 amount) external;
 }
 
-contract GIToken is ERC20 {
+contract TUSDC is ERC20 {
     address public owner;
     ILendingPool public lendingPool;
 
-    constructor(address _lendingPool) ERC20("MyToken", "MTK") {
+    constructor(address _lendingPool) ERC20("Test USDC", "TUSDC") {
         lendingPool = ILendingPool(_lendingPool);
 
+        // 초기 발행량을 lendingpool에게 발행해줍니다.
         uint256 initialSupply = 1e8 * 10**decimals();
         _mint(_lendingPool, initialSupply);
     }
