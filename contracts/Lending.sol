@@ -5,12 +5,19 @@ pragma solidity 0.8.19;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
+interface IPool {
+    function transferETH(address to, uint256 amount) external;
+
+    function transferToken(IERC20 token, address to, uint256 amount) external;
+}
+
 contract Lending {
     using SafeMath for uint256;
 
     address public owner;
+    IPool public pool;
     uint256 public feePercentage; // 1 == 0.1%
-    uint256 public monthlyInterest; // 1 == 0.1%
+    uint256 public yearInterestPer; // 1 == 0.1%
     IERC20 public token;
 
     struct BorrowerInfo {
@@ -19,21 +26,22 @@ contract Lending {
         uint256 borrowingTimestamp;
         uint256 deadlineTimestamp;
         uint256 lastInterestCalculationTimestamp;
-        uint256 interest;
+        uint256 interestPerSecond;
         uint256 feeAmount;
         uint256 repayAmount;
     }
 
-    mapping(address => BorrowerInfo[]) public borrowerInfos;
+    mapping(address => mapping(uint256 => BorrowerInfo)) public borrowerInfos;
 
     event Borrow(
         address dao,
         address indexed borrower,
         uint256 amount,
-        uint256 interest,
+        uint256 perSecondInterest,
         uint256 feeAmount,
         uint256 deadlineTimestamp
     );
+
     event Repay(
         address indexed borrower,
         uint256 amount,
@@ -42,6 +50,7 @@ contract Lending {
         uint256 repayAmount,
         uint256 timestamp
     );
+
     event Pay(
         address indexed borrower,
         uint256 amount,
@@ -52,13 +61,15 @@ contract Lending {
 
     constructor(
         address _owner,
+        address _pool,
         uint256 _feePercentage,
-        uint256 _monthlyInterest,
+        uint256 _yearInterestPer,
         address _token
     ) {
         owner = _owner;
+        pool = IPool(_pool);
         feePercentage = _feePercentage;
-        monthlyInterest = _monthlyInterest;
+        yearInterestPer = _yearInterestPer;
         token = IERC20(_token);
     }
 
@@ -68,241 +79,124 @@ contract Lending {
     }
 
     function borrow(
-        address borrower,
-        address dao,
-        uint256 amount,
-        uint256 deadlineTimestamp
-    ) external {
-        uint256 borrowingTimestamp = block.timestamp;
-        uint256 interest = calculateInterest(
-            amount,
-            borrowingTimestamp,
-            block.timestamp,
-            monthlyInterest
-        );
-        BorrowerInfo memory info = BorrowerInfo(
+        address borrower, // whitelist borrower
+        address dao, // whitelist dao
+        uint256 id, // backend dao data id
+        uint256 amount, // borrow amount
+        uint256 deadlineTimestamp // repayment deadline, is not repay before this time, the pay is all be interest.
+    ) external onlyOwner {
+        // only owner(backend) can borrow
+        require(amount > 0, "Invalid amount");
+        require(deadlineTimestamp > 3 * 30 days, "Too long");
+
+        uint256 nowTimestamp = block.timestamp;
+        require(nowTimestamp < deadlineTimestamp, "Invalid deadline");
+
+        BorrowerInfo storage info = borrowerInfos[borrower][id];
+
+        uint256 perSecondInterest;
+
+        if (dao == address(0)) {
+            info.dao = dao;
+            info.borrowedAmount = amount;
+            info.borrowingTimestamp = nowTimestamp;
+            info.deadlineTimestamp = deadlineTimestamp;
+            info.lastInterestCalculationTimestamp = nowTimestamp;
+
+            perSecondInterest = calculateInterestPerSecond(amount);
+            info.interestPerSecond = perSecondInterest;
+            info.feeAmount = 0;
+            info.repayAmount = 0;
+        } else {
+            info.repayAmount += calculateInterest(
+                info.lastInterestCalculationTimestamp,
+                info.interestPerSecond
+            );
+
+            info.borrowedAmount += amount;
+            info.lastInterestCalculationTimestamp = nowTimestamp;
+
+            perSecondInterest = calculateInterestPerSecond(info.borrowedAmount);
+            info.interestPerSecond = perSecondInterest;
+        }
+
+        pool.transferETH(borrower, amount);
+
+        emit Borrow(
             dao,
+            borrower,
             amount,
-            borrowingTimestamp,
-            deadlineTimestamp,
-            block.timestamp,
-            interest,
+            perSecondInterest,
             0,
-            0
+            deadlineTimestamp
         );
-        borrowerInfos[borrower].push(info);
-        emit Borrow(dao, borrower, amount, interest, 0, deadlineTimestamp);
     }
 
-    function repay() external {
-    uint256 amount;
-    uint256 interest;
-    uint256 fee;
-    uint256 repayAmount;
+    function repay(uint256 id, address repayer) external payable {
+        BorrowerInfo storage info = borrowerInfos[repayer][id];
 
-    BorrowerInfo[] storage borrowerInfoList = borrowerInfos[msg.sender];
-    for (uint256 i = 0; i < borrowerInfoList.length; i++) {
-        BorrowerInfo storage borrowerInfo = borrowerInfoList[i];
+        require(info.deadlineTimestamp >= block.timestamp, "Expired");
+        require(info.borrowedAmount <= msg.value, "Not enough amount");
 
-        uint256 borrowedAmount = borrowerInfo.borrowedAmount;
-        uint256 lastInterestCalculationTimestamp = borrowerInfo.lastInterestCalculationTimestamp;
-        uint256 deadlineTimestamp = borrowerInfo.deadlineTimestamp;
-        uint256 lendingTime = block.timestamp.sub(lastInterestCalculationTimestamp);
-        uint256 interestPerSecond = calculateInterestPerSecond(borrowedAmount, monthlyInterest);
-        uint256 newInterest = lendingTime.mul(interestPerSecond);
-        uint256 interestAmount = borrowerInfo.interest.add(newInterest);
-        uint256 repayableAmount = borrowedAmount.add(interestAmount);
+        uint256 interest = calculateInterest(
+            info.lastInterestCalculationTimestamp,
+            info.interestPerSecond
+        );
 
-        if (block.timestamp > deadlineTimestamp) {
-            uint256 lateInterest = calculateInterest(borrowedAmount, deadlineTimestamp, block.timestamp, monthlyInterest);
-            interestAmount = interestAmount.add(lateInterest);
-            newInterest = newInterest.add(lateInterest);
-        }
+        // Later
+        // uint256 totalAmount = info.amount.add(interest);
+        // uint256 totalFee = info.fee.add(totalAmount.mul(feePercentage).div(1000));
+        // uint256 payableAmount = totalAmount.sub(totalFee);
+        // token.transferFrom(msg.sender, address(this), payableAmount);
+        // token.transfer(owner, totalAmount.mul(feePercentage).div(1000));
 
-        amount = amount.add(borrowedAmount);
-        interest = interest.add(newInterest);
-        fee = fee.add(borrowerInfo.feeAmount);
-        repayAmount = repayAmount.add(borrowerInfo.repayAmount);
-
-        borrowerInfo.lastInterestCalculationTimestamp = block.timestamp;
-        borrowerInfo.interest = interestAmount;
+        info.repayAmount += interest;
+        info.borrowedAmount = 0;
+        info.lastInterestCalculationTimestamp = block.timestamp;
     }
 
-    uint256 totalAmount = amount.add(interest);
-    uint256 totalFee = fee.add(totalAmount.mul(feePercentage).div(1000));
-    uint256 payableAmount = totalAmount.sub(totalFee);
-    token.transferFrom(msg.sender, address(this), payableAmount);
-    token.transfer(owner, totalAmount.mul(feePercentage).div(1000));
+    function pay(address borrower, uint256 id) external payable onlyOwner {
+        BorrowerInfo storage info = borrowerInfos[borrower][id];
 
-    for (uint256 i = 0; i < borrowerInfoList.length; i++) {
-        BorrowerInfo storage borrowerInfo = borrowerInfoList[i];
-        uint256 borrowedAmount = borrowerInfo.borrowedAmount;
-        uint256 interestAmount = borrowerInfo.interest;
-
-        uint256 borrowerRepayAmount = borrowedAmount.add(interestAmount).mul(payableAmount).div(totalAmount);
-        uint256 borrowerFeeAmount = borrowerRepayAmount.mul(feePercentage).div(1000);
-        uint256 borrowerPayableAmount = borrowerRepayAmount.sub(borrowerFeeAmount);
-
-        borrowerInfo.feeAmount = borrowerFeeAmount;
-        borrowerInfo.repayAmount = borrowerRepayAmount;
-
-        if (borrowerPayableAmount > 0) {
-            token.transfer(msg.sender, borrowerPayableAmount);
-            emit Repay(msg.sender, borrowedAmount, interestAmount, borrowerFeeAmount, borrowerRepayAmount, block.timestamp);
-        }
-    }
-}
-
-
-    function pay(address borrower, uint256 amount) external onlyOwner {
-        BorrowerInfo[] storage borrowerInfoList = borrowerInfos[borrower];
-        require(borrowerInfoList.length > 0, "Borrower not found");
-
-        uint256 totalAmount;
-        uint256 totalInterest;
-        uint256 totalRepayAmount;
-        uint256 totalFeeAmount;
-
-        for (uint256 i = 0; i < borrowerInfoList.length; i++) {
-            BorrowerInfo storage borrowerInfo = borrowerInfoList[i];
-
-            uint256 borrowedAmount = borrowerInfo.borrowedAmount;
-            uint256 lastInterestCalculationTimestamp = borrowerInfo
-                .lastInterestCalculationTimestamp;
-            uint256 deadlineTimestamp = borrowerInfo.deadlineTimestamp;
-            uint256 lendingTime = block.timestamp.sub(
-                lastInterestCalculationTimestamp
-            );
-            uint256 interestPerSecond = calculateInterestPerSecond(
-                borrowedAmount,
-                monthlyInterest
-            );
-            uint256 newInterest = lendingTime.mul(interestPerSecond);
-            uint256 interestAmount = borrowerInfo.interest.add(newInterest);
-            uint256 repayableAmount = borrowedAmount.add(interestAmount);
-
-            if (block.timestamp > deadlineTimestamp) {
-                uint256 lateInterest = calculateInterest(
-                    borrowedAmount,
-                    deadlineTimestamp,
-                    block.timestamp,
-                    monthlyInterest
-                );
-                interestAmount = interestAmount.add(lateInterest);
-                newInterest = newInterest.add(lateInterest);
-            }
-
-            uint256 payableAmount = repayableAmount.sub(
-                borrowerInfo.repayAmount
-            );
-            uint256 feeAmount = payableAmount.mul(feePercentage).div(1000);
-            uint256 repayAmount = payableAmount.sub(feeAmount);
-
-            totalAmount = totalAmount.add(borrowedAmount);
-            totalInterest = totalInterest.add(newInterest);
-            totalRepayAmount = totalRepayAmount.add(repayAmount);
-            totalFeeAmount = totalFeeAmount.add(feeAmount);
-
-            borrowerInfo.interest = interestAmount;
-            borrowerInfo.repayAmount = borrowerInfo.repayAmount.add(
-                repayAmount
-            );
-            borrowerInfo.feeAmount = borrowerInfo.feeAmount.add(feeAmount);
+        if (info.borrowedAmount != 0) {
+            return;
         }
 
-        uint256 remainingAmount = amount;
-        for (uint256 i = 0; i < borrowerInfoList.length; i++) {
-            BorrowerInfo storage borrowerInfo = borrowerInfoList[i];
-            uint256 borrowedAmount = borrowerInfo.borrowedAmount;
-            uint256 interestAmount = borrowerInfo.interest;
-            uint256 repayAmount = borrowerInfo.repayAmount;
-            uint256 feeAmount = borrowerInfo.feeAmount;
+        if (info.repayAmount == 0) {
+            payable(borrower).transfer(msg.value);
 
-            uint256 borrowerPayableAmount = borrowedAmount
-                .add(interestAmount)
-                .sub(repayAmount)
-                .sub(feeAmount);
-            uint256 borrowerPaidAmount;
-            if (borrowerPayableAmount <= remainingAmount) {
-                borrowerPaidAmount = borrowerPayableAmount;
-                remainingAmount = remainingAmount.sub(borrowerPayableAmount);
-                borrowerInfo.repayAmount = borrowerInfo.borrowedAmount.add(
-                    borrowerInfo.interest
-                );
-            } else {
-                borrowerPaidAmount = remainingAmount;
-                borrowerInfo.repayAmount = borrowerInfo.repayAmount.add(
-                    borrowerPaidAmount.mul(borrowerPayableAmount).div(
-                        borrowerPayableAmount.add(feeAmount)
-                    )
-                );
-                remainingAmount = 0;
-            }
+            return;
+        } else {
+            // uint256 totalRepayAmount = info.repayAmount.add(fee);
+            // uint256 totalFee = info.feeAmount.add(
+            //     totalAmount.mul(feePercentage).div(1000)
+            // );
+            // uint256 payableAmount = totalAmount.sub(totalFee);
 
-            if (borrowerPaidAmount > 0) {
-                token.transferFrom(
-                    msg.sender,
-                    address(this),
-                    borrowerPaidAmount
-                );
-                token.transfer(
-                    borrower,
-                    borrowerPaidAmount.mul(borrowedAmount).div(
-                        borrowedAmount.add(interestAmount)
-                    )
-                );
-                token.transfer(
-                    owner,
-                    borrowerPaidAmount
-                        .mul(interestAmount)
-                        .div(borrowedAmount.add(interestAmount))
-                        .mul(feePercentage)
-                        .div(1000)
-                );
-                emit Pay(
-                    borrower,
-                    borrowedAmount,
-                    interestAmount,
-                    borrowerPaidAmount,
-                    block.timestamp
-                );
-            }
+            payable(borrower).transfer(msg.value.sub(info.repayAmount));
 
-            if (remainingAmount == 0) {
-                break;
-            }
-        }
-
-        require(remainingAmount == 0, "Insufficient payment");
-        if (totalRepayAmount > 0) {
-            token.transfer(owner, totalFeeAmount);
-            emit Repay(
-                borrower,
-                totalAmount,
-                totalInterest,
-                totalFeeAmount,
-                totalRepayAmount,
-                block.timestamp
-            );
+            info.repayAmount = 0;
+            info.borrowedAmount = 0;
+            info.lastInterestCalculationTimestamp = 0;
         }
     }
 
     function calculateInterest(
-        uint256 amount,
         uint256 startTime,
-        uint256 endTime,
-        uint256 monthlyInterestRate
-    ) private pure returns (uint256) {
-        uint256 time = endTime.sub(startTime);
-        uint256 interestRate = monthlyInterestRate.mul(time).div(30 days);
-        return amount.mul(interestRate).div(1000);
+        uint256 interestPerSecond
+    ) private view returns (uint256) {
+        uint256 time = block.timestamp.sub(startTime);
+        uint256 interest = interestPerSecond.mul(time);
+        return interest;
     }
 
     function calculateInterestPerSecond(
-        uint256 amount,
-        uint256 monthlyInterestRate
-    ) private pure returns (uint256) {
-        uint256 interestRatePerSecond = monthlyInterestRate.div(30 days);
-        return amount.mul(interestRatePerSecond);
+        uint256 amount
+    ) public view returns (uint256) {
+        uint256 interest = amount.mul(yearInterestPer).mul(1e18).mul(10) /
+            (1e18 * 365 days);
+        return interest;
     }
+
+    receive() external payable {}
 }

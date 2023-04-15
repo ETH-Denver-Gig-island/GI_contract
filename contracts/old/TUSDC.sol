@@ -14,7 +14,7 @@ contract TUSDC is ERC20 {
     constructor(address _lendingPool) ERC20("Test USDC", "TUSDC") {
         lendingPool = ILendingPool(_lendingPool);
 
-        // 초기 발행량을 lendingpool에게 발행해줍니다.
+        // ini lendingpool에게 발행해줍니다.
         uint256 initialSupply = 1e8 * 10**decimals();
         _mint(_lendingPool, initialSupply);
     }
